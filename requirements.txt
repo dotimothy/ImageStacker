@@ -1,0 +1,7 @@
+# 🚀 Dependencies to Install ImageStacker
+numpy
+opencv-python
+rawpy
+tqdm
+torch
+kornia
