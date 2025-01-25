@@ -10,6 +10,8 @@ from tqdm import tqdm
 import torch
 import kornia as K
 import gc
+from datetime import datetime
+import astroalign as aa
 
 # Normalize an Image (float) from 0-1
 def normalize(img):
@@ -109,37 +111,83 @@ def register_image(img1,img2,numFeatures=5000,match=0.9,refill=True):
     
     return transformed_img
 
+# Crude. Assume Tripod is in Same Position the Entire Time
+def register_images_by_filepath(img1,img2,img1_path, img2_path,refill=True):
+    height, width = img1.shape[:2]
+
+    # Get file modification times
+    time1 = datetime.fromtimestamp(os.path.getctime(img1_path))
+    time2 = datetime.fromtimestamp(os.path.getctime(img2_path))
+
+    # Calculate time difference in seconds
+    time_delta_seconds = (time2 - time1).total_seconds()
+
+    # Earth's rotation rate in radians per second
+    earth_rotation_rate = 2 * np.pi / (24 * 60 * 60)
+
+    # Calculate rotation angle 
+    rotation_angle = earth_rotation_rate * time_delta_seconds
+
+    # Calculate rotation matrix
+    rotation_matrix = cv.getRotationMatrix2D((width / 2, height / 2), np.degrees(rotation_angle), 1)
+
+    # Rotate the second image
+    registered_img2 = cv.warpAffine(img1, rotation_matrix, (width, height))
+
+    if(refill): 
+        registered_img2 = np.where(registered_img2 != 0, registered_img2, img1) 
+
+    return registered_img2
+
 # Stacks Images with Automatic Alignment
-def stack_images(imgStack,method='mean',align=True,refIndex=0.5,orbFeatures=5000,orbMatch=0.9,refill=True):
+def stack_images(imgStack,method='mean',align=True,refIndex=0.5,refill=True,alignMethod='orb'):
     if align:
         refIndex = len(imgStack) // 2 if refIndex == 0.5 else refIndex
         newImgs = []
         for i in tqdm(range(imgStack.shape[0])): 
-            newImgs.append(normalize(imgStack[i]) if i == refIndex else register_image(imgStack[i],imgStack[refIndex],numFeatures=orbFeatures,match=orbMatch,refill=refill))
+            newImgs.append(normalize(imgStack[i]) if i == refIndex else register_image(imgStack[i],imgStack[refIndex],refill=refill) if alignMethod=='orb' else aa.register(imgStack[refIndex],imgStack[i])[0])
         imgStack = np.stack(newImgs)
     stackedImg = np.median(imgStack,axis=0) if method == 'med' else np.mean(imgStack,axis=0)
     return stackedImg
 
 # Stack Images with Automatic Alignment (Memory Saver with Mean Method)
-def stack_images_opt(stackFiles,gamma=(1,1),use_camera_wb=False,half_size=True,no_auto_bright=False,align=True,refIndex=0.5,orbFeatures=5000,orbMatch=0.9,refill=True,stackedDark=None):
+def stack_images_opt(stackFiles,gamma=(1,1),use_camera_wb=False,half_size=True,no_auto_bright=False,align=True,refIndex=0.5,refill=True,alignMethod='orb',stackedDark=None):
+    stackedImg = 0
+    rawSettings = (False,gamma,half_size,use_camera_wb,no_auto_bright)
+    if align:
+        refIndex = len(stackFiles) // 2 if refIndex == 0.5 else refIndex
+        refImg = np.clip(raw_to_numpy(stackFiles[refIndex],*rawSettings) - (stackedDark if stackedDark is not None else 0),a_min=0,a_max=1)
+        for i in tqdm(range(len(stackFiles))):
+            if i == refIndex:
+                stackedImg += refImg/len(stackFiles) 
+            else: 
+                capImg = np.clip(raw_to_numpy(stackFiles[i],*rawSettings) - (stackedDark if stackedDark is not None else 0),a_min=0,a_max=1)
+                stackedImg += ((register_image(capImg,refImg,refill=refill) if alignMethod == 'orb' else aa.register(capImg,refImg)[0]) if align else capImg)/len(stackFiles)
+        gc.collect()
+    return stackedImg
+
+def stack_images_crude(stackFiles,gamma=(1,1),use_camera_wb=False,half_size=True,no_auto_bright=False,refIndex=0.5,align=False,stackedDark=None):
     stackedImg = 0
     rawSettings = (False,gamma,half_size,use_camera_wb,no_auto_bright)
     refIndex = len(stackFiles) // 2 if refIndex == 0.5 else refIndex
     refImg = np.clip(raw_to_numpy(stackFiles[refIndex],*rawSettings) - (stackedDark if stackedDark is not None else 0),a_min=0,a_max=1)
+    refPath = stackFiles[refIndex]
     for i in tqdm(range(len(stackFiles))):
         if i == refIndex:
             stackedImg += refImg/len(stackFiles) 
         else: 
             capImg = np.clip(raw_to_numpy(stackFiles[i],*rawSettings) - (stackedDark if stackedDark is not None else 0),a_min=0,a_max=1)
-            stackedImg += (register_image(capImg,refImg,numFeatures=orbFeatures,match=orbMatch,refill=refill) if align else capImg)/len(stackFiles)
+            stackedImg += (register_images_by_filepath(refImg,capImg,refPath,stackFiles[i]) if align else capImg)/len(stackFiles)
         gc.collect()
     return stackedImg
+
 
 if __name__ == '__main__': 
     dataDir = './data'
     os.makedirs(dataDir,exist_ok=True)
-    testDir = './data/orionbelt1'
-    stackFiles = sorted([f'{testDir}/{file}' for file in os.listdir(testDir) if file.endswith('.CR2')])
-    stackedImg = stack_images_opt(stackFiles,half_size=True,use_camera_wb=True,no_auto_bright=False,align=True,orbFeatures=100000,orbMatch=0.9)
+    testDir = './data/mtPinos'
+    toExclude = [f'DSC0{i+8770}.ARW' for i in range(26)]
+    stackFiles = sorted([f'{testDir}/{file}' for file in os.listdir(testDir) if file.endswith('.ARW') and file not in toExclude])
+    stackedImg = stack_images_opt(stackFiles,half_size=False,use_camera_wb=True,no_auto_bright=False,align=True,alignMethod='aa')
     cv.imwrite(f'{testDir}/stackedImg.tiff',float_to_int16(stackedImg[...,::-1]))
 

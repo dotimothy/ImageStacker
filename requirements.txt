@@ -5,3 +5,4 @@ rawpy
 tqdm
 torch
 kornia
+astroalign
